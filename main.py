@@ -1,17 +1,47 @@
 import sys
 import os
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, TypeVar, Callable
 from enum import Enum
 from dotenv import load_dotenv
 import googleapiclient.discovery
+from googleapiclient.errors import HttpError
 from youtube_transcript_api import YouTubeTranscriptApi
 import re
 import json
 from pathlib import Path
+import time
 
 # Load environment variables
 load_dotenv()
 YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
+
+# Constants for API retry
+MAX_RETRIES = 3
+RETRY_DELAY = 5  # seconds
+
+T = TypeVar('T')
+
+def with_retry[T](func: Callable[[], T]) -> T:
+    """
+    Decorator to retry API calls with exponential backoff.
+
+    Args:
+        func: Function to retry
+
+    Returns:
+        T: Result of the function call
+    """
+    for attempt in range(MAX_RETRIES):
+        try:
+            return func()
+        except HttpError as e:
+            if e.resp.status in [429, 500, 503]:  # Rate limit or server error
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_DELAY * (2 ** attempt)  # Exponential backoff
+                    print(f"API rate limit hit or server error. Retrying in {delay} seconds...")
+                    time.sleep(delay)
+                    continue
+            raise
 
 class OutputFormat(Enum):
     """Supported output formats for transcripts."""
@@ -20,12 +50,6 @@ class OutputFormat(Enum):
     SRT = 'srt'
 
 def get_output_format() -> OutputFormat:
-    """
-    Asks user to select the desired output format.
-
-    Returns:
-        OutputFormat: The selected output format
-    """
     print("\nAvailable output formats:")
     for i, format in enumerate(OutputFormat, 1):
         print(f"{i}. {format.value}")
@@ -152,17 +176,51 @@ def resolve_custom_handle(handle: str) -> Optional[str]:
     """
     try:
         youtube = googleapiclient.discovery.build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
-        request = youtube.search().list(
-            part='snippet',
-            q=f"@{handle}",
-            type='channel',
-            maxResults=1
-        )
-        response = request.execute()
 
+        # First try to get the channel directly using the handle
+        def direct_lookup():
+            request = youtube.channels().list(
+                part='id',
+                forHandle=handle
+            )
+            return request.execute()
+
+        response = with_retry(direct_lookup)
         items = response.get('items', [])
         if items:
-            return items[0]['snippet']['channelId']
+            return items[0]['id']
+
+        # If direct handle lookup fails, try using search as fallback
+        def search_lookup():
+            request = youtube.search().list(
+                part='snippet',
+                q=f"@{handle}",
+                type='channel',
+                maxResults=1
+            )
+            return request.execute()
+
+        response = with_retry(search_lookup)
+        items = response.get('items', [])
+        if items:
+            # Verify the handle matches to avoid incorrect results
+            channel_id = items[0]['snippet']['channelId']
+
+            def channel_lookup():
+                request = youtube.channels().list(
+                    part='snippet',
+                    id=channel_id
+                )
+                return request.execute()
+
+            channel_response = with_retry(channel_lookup)
+            channel_items = channel_response.get('items', [])
+
+            if channel_items:
+                custom_url = channel_items[0]['snippet'].get('customUrl', '')
+                if custom_url and custom_url.lower() == handle.lower():
+                    return channel_id
+
         return None
     except Exception as e:
         raise Exception(f"Failed to resolve handle: {str(e)}")
@@ -291,6 +349,64 @@ def get_channel_videos(channel_id: str) -> List[str]:
 
     return video_ids
 
+def get_channel_info(channel_id: str) -> Optional[tuple[str, str]]:
+    """
+    Gets channel name and sanitized folder name from channel ID.
+
+    Args:
+        channel_id (str): The channel ID
+
+    Returns:
+        Optional[tuple[str, str]]: Tuple of (channel name, sanitized folder name) if found, None otherwise
+    """
+    try:
+        youtube = googleapiclient.discovery.build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
+        request = youtube.channels().list(
+            part='snippet',
+            id=channel_id
+        )
+        response = request.execute()
+
+        items = response.get('items', [])
+        if items:
+            channel_name = items[0]['snippet']['title']
+            # Sanitize folder name by removing invalid characters
+            folder_name = re.sub(r'[<>:"/\\|?*]', '_', channel_name)
+            return channel_name, folder_name
+        return None
+    except Exception as e:
+        print(f"Error getting channel info: {str(e)}")
+        return None
+
+def get_video_info(video_id: str) -> Optional[tuple[str, str]]:
+    """
+    Gets video title and sanitized filename from video ID.
+
+    Args:
+        video_id (str): The video ID
+
+    Returns:
+        Optional[tuple[str, str]]: Tuple of (video title, sanitized filename) if found, None otherwise
+    """
+    try:
+        youtube = googleapiclient.discovery.build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
+        request = youtube.videos().list(
+            part='snippet',
+            id=video_id
+        )
+        response = request.execute()
+
+        items = response.get('items', [])
+        if items:
+            video_title = items[0]['snippet']['title']
+            # Sanitize filename by removing invalid characters
+            filename = re.sub(r'[<>:"/\\|?*]', '_', video_title)
+            return video_title, filename
+        return None
+    except Exception as e:
+        print(f"Error getting video info: {str(e)}")
+        return None
+
 def download_channel_transcripts(channel_url: str) -> None:
     """
     Downloads all available transcripts from a YouTube channel.
@@ -309,6 +425,16 @@ def download_channel_transcripts(channel_url: str) -> None:
 
         print(f"Resolved channel ID: {channel_id}")
 
+        # Get channel info
+        channel_info = get_channel_info(channel_id)
+        if not channel_info:
+            print("Error: Could not get channel information. Using channel ID as folder name.")
+            channel_name = channel_id
+            folder_name = channel_id
+        else:
+            channel_name, folder_name = channel_info
+            print(f"Channel Name: {channel_name}")
+
         # Get output format from user
         output_format = get_output_format()
         print(f"Selected format: {output_format.value}")
@@ -325,7 +451,7 @@ def download_channel_transcripts(channel_url: str) -> None:
             return
 
         # Create output directory
-        output_dir = Path('transcripts') / channel_id
+        output_dir = Path('transcripts') / folder_name
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Download transcripts for each video
@@ -335,11 +461,19 @@ def download_channel_transcripts(channel_url: str) -> None:
 
         for i, video_id in enumerate(video_ids, 1):
             try:
-                print(f"\nProcessing video {i}/{len(video_ids)}: {video_id}")
+                # Get video info
+                video_info = get_video_info(video_id)
+                if video_info:
+                    video_title, filename = video_info
+                    print(f"\nProcessing video {i}/{len(video_ids)}: {video_title}")
+                else:
+                    print(f"\nProcessing video {i}/{len(video_ids)}: {video_id}")
+                    filename = video_id
+
                 transcript = YouTubeTranscriptApi.get_transcript(video_id)
 
                 # Save transcript in the selected format
-                output_file = output_dir / video_id
+                output_file = output_dir / filename
                 save_transcript(transcript, output_file, output_format)
                 print(f"Saved transcript to {output_file}.{output_format.value}")
                 successful += 1
@@ -355,7 +489,7 @@ def download_channel_transcripts(channel_url: str) -> None:
                 continue
 
         # Print summary
-        print(f"\nDownload Summary:")
+        print(f"\nDownload Summary for '{channel_name}':")
         print(f"Total videos found: {len(video_ids)}")
         print(f"Successfully downloaded: {successful}")
         print(f"No captions available: {no_captions}")
@@ -384,6 +518,15 @@ def download_single_video_transcript(video_url: str) -> None:
         print(f"Extracted video ID: {video_id}")
 
         try:
+            # Get video info
+            video_info = get_video_info(video_id)
+            if video_info:
+                video_title, filename = video_info
+                print(f"Video Title: {video_title}")
+            else:
+                print("Could not get video title. Using video ID as filename.")
+                filename = video_id
+
             # Download transcript
             transcript = YouTubeTranscriptApi.get_transcript(video_id)
 
@@ -392,7 +535,7 @@ def download_single_video_transcript(video_url: str) -> None:
             output_dir.mkdir(parents=True, exist_ok=True)
 
             # Save transcript in the selected format
-            output_file = output_dir / video_id
+            output_file = output_dir / filename
             save_transcript(transcript, output_file, output_format)
             print(f"Saved transcript to {output_file}.{output_format.value}")
 
@@ -448,13 +591,20 @@ def download_multiple_video_transcripts(file_path: str) -> None:
                         failed += 1
                         continue
 
-                    print(f"Extracted video ID: {video_id}")
+                    # Get video info
+                    video_info = get_video_info(video_id)
+                    if video_info:
+                        video_title, filename = video_info
+                        print(f"Video Title: {video_title}")
+                    else:
+                        print("Could not get video title. Using video ID as filename.")
+                        filename = video_id
 
                     # Download transcript
                     transcript = YouTubeTranscriptApi.get_transcript(video_id)
 
                     # Save transcript in the selected format
-                    output_file = output_dir / video_id
+                    output_file = output_dir / filename
                     save_transcript(transcript, output_file, output_format)
                     print(f"Saved transcript to {output_file}.{output_format.value}")
                     successful += 1
