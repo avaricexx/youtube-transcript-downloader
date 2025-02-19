@@ -72,28 +72,152 @@ def save_transcript(transcript: List[Dict[str, Any]], output_file: Path, format:
                 f.write(f"{start_time} --> {end_time}\n")
                 f.write(f"{entry['text']}\n\n")
 
-def extract_channel_id(channel_url: str) -> str:
+def extract_channel_id(channel_url: str) -> Optional[str]:
     """
     Extracts channel ID from various forms of YouTube channel URLs.
+    Makes an API call if necessary to resolve custom URLs.
 
     Args:
         channel_url (str): The URL of the YouTube channel
 
     Returns:
-        str: The channel ID
+        Optional[str]: The channel ID if found, None otherwise
     """
+    # Clean the URL
+    channel_url = channel_url.strip().rstrip('/')
+
+    # Try direct ID extraction first
     patterns = [
-        r'youtube\.com/channel/(UC[\w-]+)',  # Standard channel URL
-        r'youtube\.com/c/([^/]+)',           # Custom channel URL
-        r'youtube\.com/@([^/]+)'             # Handle URL
+        (r'youtube\.com/channel/(UC[\w-]+)', lambda x: x),  # Standard channel URL
+        (r'youtube\.com/c/([^/]+)', lambda x: resolve_custom_url(x)),  # Custom channel URL
+        (r'youtube\.com/@([^/]+)', lambda x: resolve_custom_handle(x)),  # Handle URL
+        (r'youtube\.com/user/([^/]+)', lambda x: resolve_username(x))  # Legacy username URL
     ]
 
-    for pattern in patterns:
+    for pattern, resolver in patterns:
         match = re.search(pattern, channel_url)
         if match:
-            return match.group(1)
+            identifier = match.group(1)
+            try:
+                channel_id = resolver(identifier)
+                if channel_id:
+                    return channel_id
+            except Exception as e:
+                print(f"Error resolving channel identifier '{identifier}': {str(e)}")
+                continue
 
-    return channel_url  # Return as is if no pattern matches
+    # If no pattern matches, try resolving the entire URL
+    try:
+        return resolve_channel_url(channel_url)
+    except Exception as e:
+        print(f"Error resolving channel URL: {str(e)}")
+        return None
+
+def resolve_custom_url(custom_url: str) -> Optional[str]:
+    """
+    Resolves a custom channel URL to a channel ID using the YouTube API.
+
+    Args:
+        custom_url (str): The custom URL part of the channel
+
+    Returns:
+        Optional[str]: The channel ID if found, None otherwise
+    """
+    try:
+        youtube = googleapiclient.discovery.build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
+        request = youtube.search().list(
+            part='snippet',
+            q=custom_url,
+            type='channel',
+            maxResults=1
+        )
+        response = request.execute()
+
+        items = response.get('items', [])
+        if items:
+            return items[0]['snippet']['channelId']
+        return None
+    except Exception as e:
+        raise Exception(f"Failed to resolve custom URL: {str(e)}")
+
+def resolve_custom_handle(handle: str) -> Optional[str]:
+    """
+    Resolves a channel handle to a channel ID using the YouTube API.
+
+    Args:
+        handle (str): The channel handle (without @)
+
+    Returns:
+        Optional[str]: The channel ID if found, None otherwise
+    """
+    try:
+        youtube = googleapiclient.discovery.build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
+        request = youtube.search().list(
+            part='snippet',
+            q=f"@{handle}",
+            type='channel',
+            maxResults=1
+        )
+        response = request.execute()
+
+        items = response.get('items', [])
+        if items:
+            return items[0]['snippet']['channelId']
+        return None
+    except Exception as e:
+        raise Exception(f"Failed to resolve handle: {str(e)}")
+
+def resolve_username(username: str) -> Optional[str]:
+    """
+    Resolves a YouTube username to a channel ID using the YouTube API.
+
+    Args:
+        username (str): The YouTube username
+
+    Returns:
+        Optional[str]: The channel ID if found, None otherwise
+    """
+    try:
+        youtube = googleapiclient.discovery.build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
+        request = youtube.channels().list(
+            part='id',
+            forUsername=username
+        )
+        response = request.execute()
+
+        items = response.get('items', [])
+        if items:
+            return items[0]['id']
+        return None
+    except Exception as e:
+        raise Exception(f"Failed to resolve username: {str(e)}")
+
+def resolve_channel_url(url: str) -> Optional[str]:
+    """
+    Attempts to resolve any YouTube URL to a channel ID using the YouTube API.
+
+    Args:
+        url (str): The YouTube channel URL
+
+    Returns:
+        Optional[str]: The channel ID if found, None otherwise
+    """
+    try:
+        youtube = googleapiclient.discovery.build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
+        request = youtube.search().list(
+            part='snippet',
+            q=url,
+            type='channel',
+            maxResults=1
+        )
+        response = request.execute()
+
+        items = response.get('items', [])
+        if items:
+            return items[0]['snippet']['channelId']
+        return None
+    except Exception as e:
+        raise Exception(f"Failed to resolve channel URL: {str(e)}")
 
 def extract_video_id(video_url: str) -> str:
     """
@@ -177,23 +301,38 @@ def download_channel_transcripts(channel_url: str) -> None:
     try:
         print(f"\nProcessing channel: {channel_url}")
 
+        # Extract channel ID
+        channel_id = extract_channel_id(channel_url)
+        if not channel_id:
+            print("Error: Could not extract or resolve channel ID. Please check the URL and try again.")
+            return
+
+        print(f"Resolved channel ID: {channel_id}")
+
         # Get output format from user
         output_format = get_output_format()
         print(f"Selected format: {output_format.value}")
 
-        # Extract channel ID
-        channel_id = extract_channel_id(channel_url)
-        print(f"Extracted channel ID: {channel_id}")
-
         # Get all video IDs from the channel
-        video_ids = get_channel_videos(channel_id)
-        print(f"Found {len(video_ids)} videos")
+        try:
+            video_ids = get_channel_videos(channel_id)
+            if not video_ids:
+                print("No videos found in the channel. The channel might be private or have no public videos.")
+                return
+            print(f"Found {len(video_ids)} videos")
+        except Exception as e:
+            print(f"Error retrieving videos from channel: {str(e)}")
+            return
 
         # Create output directory
         output_dir = Path('transcripts') / channel_id
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Download transcripts for each video
+        successful = 0
+        failed = 0
+        no_captions = 0
+
         for i, video_id in enumerate(video_ids, 1):
             try:
                 print(f"\nProcessing video {i}/{len(video_ids)}: {video_id}")
@@ -203,12 +342,25 @@ def download_channel_transcripts(channel_url: str) -> None:
                 output_file = output_dir / video_id
                 save_transcript(transcript, output_file, output_format)
                 print(f"Saved transcript to {output_file}.{output_format.value}")
+                successful += 1
 
             except Exception as e:
-                print(f"Error downloading transcript for video {video_id}: {str(e)}")
+                error_message = str(e)
+                if "No transcripts were found" in error_message:
+                    print(f"No captions available for video {video_id}")
+                    no_captions += 1
+                else:
+                    print(f"Error downloading transcript for video {video_id}: {error_message}")
+                    failed += 1
                 continue
 
-        print(f"\nFinished processing channel. Transcripts saved in {output_dir}")
+        # Print summary
+        print(f"\nDownload Summary:")
+        print(f"Total videos found: {len(video_ids)}")
+        print(f"Successfully downloaded: {successful}")
+        print(f"No captions available: {no_captions}")
+        print(f"Failed to download: {failed}")
+        print(f"Transcripts saved in: {output_dir}")
 
     except Exception as e:
         print(f"Error processing channel: {str(e)}")
@@ -257,8 +409,70 @@ def download_multiple_video_transcripts(file_path: str) -> None:
     Args:
         file_path (str): Path to the file containing video URLs (one per line)
     """
-    # TODO: Implement multiple video transcript download functionality
-    pass
+    try:
+        # Check if file exists
+        if not os.path.exists(file_path):
+            print(f"Error: File '{file_path}' does not exist.")
+            return
+
+        # Get output format from user
+        output_format = get_output_format()
+        print(f"Selected format: {output_format.value}")
+
+        # Create output directory
+        output_dir = Path('transcripts') / 'multiple_videos'
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Read and process video URLs
+        successful = 0
+        failed = 0
+
+        with open(file_path, 'r', encoding='utf-8') as f:
+            video_urls = [line.strip() for line in f if line.strip()]
+            total_videos = len(video_urls)
+
+            if total_videos == 0:
+                print("No video URLs found in the file.")
+                return
+
+            print(f"\nFound {total_videos} video URLs in the file.")
+
+            for i, video_url in enumerate(video_urls, 1):
+                try:
+                    print(f"\nProcessing video {i}/{total_videos}: {video_url}")
+
+                    # Extract video ID
+                    video_id = extract_video_id(video_url)
+                    if not video_id:
+                        print(f"Error: Could not extract video ID from URL: {video_url}")
+                        failed += 1
+                        continue
+
+                    print(f"Extracted video ID: {video_id}")
+
+                    # Download transcript
+                    transcript = YouTubeTranscriptApi.get_transcript(video_id)
+
+                    # Save transcript in the selected format
+                    output_file = output_dir / video_id
+                    save_transcript(transcript, output_file, output_format)
+                    print(f"Saved transcript to {output_file}.{output_format.value}")
+                    successful += 1
+
+                except Exception as e:
+                    print(f"Error processing video {video_url}: {str(e)}")
+                    failed += 1
+                    continue
+
+        # Print summary
+        print(f"\nDownload Summary:")
+        print(f"Total videos processed: {total_videos}")
+        print(f"Successfully downloaded: {successful}")
+        print(f"Failed to download: {failed}")
+        print(f"Transcripts saved in: {output_dir}")
+
+    except Exception as e:
+        print(f"Error reading file: {str(e)}")
 
 def display_menu() -> None:
     """Displays the main menu of the application."""
